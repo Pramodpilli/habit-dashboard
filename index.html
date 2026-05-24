@@ -1,0 +1,1554 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              window.parent.postMessage({
+                type: 'screenshotData',
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Habit Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&amp;family=Syne:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0e0e10;--surface:#18181c;--surface2:#222228;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.13);--text:#f0ede8;--muted:#888;--accent:#b5f565;--accent2:#5ad3c8;--warn:#f5c842;--danger:#f56565;--font-d:'Syne',sans-serif;--font-m:'DM Mono',monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-d);overflow-x:hidden}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:99px}
+
+.app{display:grid;grid-template-columns:220px 1fr;grid-template-rows:auto 1fr;min-height:100vh}
+.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;border-bottom:1px solid var(--border);background:var(--surface)}
+.logo{font-size:17px;font-weight:800;letter-spacing:-.5px;color:var(--accent)}
+.logo span{color:var(--text);font-weight:400}
+.topbar-right{display:flex;align-items:center;gap:10px}
+.month-nav{display:flex;align-items:center;gap:8px}
+.month-nav button{background:var(--surface2);border:1px solid var(--border2);color:var(--text);width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:background .15s}
+.month-nav button:hover{background:rgba(181,245,101,0.1);border-color:var(--accent)}
+.month-label{font-size:15px;font-weight:700;min-width:150px;text-align:center}
+
+.sidebar{background:var(--surface);border-right:1px solid var(--border);padding:1.25rem 0;display:flex;flex-direction:column;gap:4px}
+.sidebar-section{padding:0 1rem;margin-bottom:8px}
+.sidebar-label{font-size:10px;font-weight:600;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:8px}
+.habit-list-sidebar{padding:0 8px;display:flex;flex-direction:column;gap:2px;flex:1;overflow-y:auto}
+.habit-pill{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;font-size:12px;color:var(--muted)}
+.habit-pill .hpct{margin-left:auto;font-family:var(--font-m);font-size:11px}
+.sidebar-footer{padding:1rem;margin-top:auto}
+.add-btn-main{width:100%;padding:9px;background:var(--accent);color:#0e0e10;border:none;border-radius:8px;font-family:var(--font-d);font-size:13px;font-weight:700;cursor:pointer;letter-spacing:.5px}
+.add-btn-main:hover{opacity:.85}
+
+.main{padding:1.5rem;overflow:auto;display:flex;flex-direction:column;gap:1.5rem}
+
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem 1.25rem;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--al,var(--accent))}
+.sc-label{font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-weight:600;margin-bottom:6px}
+.sc-val{font-size:28px;font-weight:800;line-height:1;font-family:var(--font-m)}
+.sc-sub{font-size:11px;color:var(--muted);margin-top:4px}
+
+.progress-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.25rem}
+.progress-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.progress-title{font-size:13px;font-weight:700}
+.progress-pct{font-family:var(--font-m);font-size:22px;font-weight:500;color:var(--accent)}
+.pb-track{height:8px;background:var(--surface2);border-radius:99px;overflow:hidden}
+.pb-fill{height:100%;background:var(--accent);border-radius:99px;transition:width .6s}
+
+.grid-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.grid-header{padding:1rem 1.25rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.grid-title{font-size:13px;font-weight:700}
+.grid-scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+.th-habit{text-align:left;padding:10px 1.25rem;font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted);min-width:200px;position:sticky;left:0;background:var(--surface);z-index:2;border-right:1px solid var(--border)}
+.th-day{font-size:10px;color:var(--muted);padding:6px 3px;text-align:center;min-width:32px;font-family:var(--font-m)}
+.th-day.today{color:var(--accent);font-weight:600}
+.th-pct{font-size:10px;color:var(--muted);padding:6px 12px;text-align:center;min-width:50px}
+
+.td-habit-cell{padding:0;position:sticky;left:0;background:var(--surface);z-index:1;border-right:1px solid var(--border)}
+.habit-row-inner{display:flex;align-items:center;gap:6px;padding:8px 1.25rem;height:46px}
+.habit-emoji{font-size:15px;flex-shrink:0}
+.habit-name-text{flex:1;font-size:13px;font-weight:500;color:var(--text)}
+.habit-actions{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+tr:hover .habit-actions{opacity:1}
+.act-btn{background:none;border:1px solid transparent;border-radius:5px;cursor:pointer;font-size:13px;padding:3px 6px;color:var(--muted);transition:all .15s;line-height:1}
+.act-btn.edit:hover{color:var(--accent2);border-color:var(--accent2);background:rgba(90,211,200,0.1)}
+.act-btn.del:hover{color:var(--danger);border-color:var(--danger);background:rgba(245,101,101,0.1)}
+
+.td-cell{text-align:center;padding:4px 3px}
+.td-cell.today-col{background:rgba(181,245,101,0.04)}
+.cb{width:20px;height:20px;border-radius:4px;border:1.5px solid var(--border2);background:transparent;cursor:pointer;appearance:none;-webkit-appearance:none;transition:all .15s;position:relative;display:inline-block;vertical-align:middle}
+.cb:checked{background:var(--accent);border-color:var(--accent)}
+.cb:checked::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:#0e0e10;font-weight:800}
+.cb:disabled{opacity:.2;cursor:default}
+.td-pct{font-family:var(--font-m);font-size:12px;font-weight:500;text-align:center;padding:4px 12px}
+.td-goal{font-family:var(--font-m);font-size:11px;text-align:center;padding:4px 8px}
+.goal-bar{height:4px;background:var(--surface2);border-radius:99px;margin-top:4px;overflow:hidden}
+.goal-fill{height:100%;border-radius:99px}
+.summary-row td{font-size:11px;font-family:var(--font-m);color:var(--muted);text-align:center;padding:4px 3px;border-top:1px solid var(--border);background:var(--surface)}
+.summary-row .td-habit-cell .habit-row-inner{font-size:11px;color:var(--muted);font-family:var(--font-m);font-weight:400;padding:6px 1.25rem;height:auto}
+
+.mood-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.mood-header{padding:1rem 1.25rem;border-bottom:1px solid var(--border);font-size:13px;font-weight:700}
+.mood-row{display:flex;align-items:center;padding:10px 1.25rem;border-bottom:1px solid var(--border);gap:12px}
+.mood-row:last-child{border-bottom:none}
+.mood-label{font-size:13px;font-weight:500;min-width:110px}
+.mood-dots{display:flex;gap:6px}
+.mood-dot{width:30px;height:30px;border-radius:50%;border:1.5px solid var(--border2);cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .15s;background:transparent}
+.mood-dot:hover{border-color:var(--accent2);transform:scale(1.15)}
+.mood-dot.selected{border-color:var(--accent2);background:rgba(90,211,200,0.15)}
+
+.chart-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.25rem}
+.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem}
+.chart-title{font-size:13px;font-weight:700}
+.chart-wrap{position:relative;height:200px}
+
+.tabs{display:flex;gap:4px;padding:0 1rem}
+.tab{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted);transition:all .15s;background:transparent;border:none;font-family:var(--font-d)}
+.tab:hover{color:var(--text)}
+.tab.active{background:rgba(181,245,101,0.1);color:var(--accent)}
+
+/* MODALS */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:1.5rem;width:380px;max-width:92vw}
+.modal h3{font-size:17px;font-weight:700;margin-bottom:1rem}
+.modal label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px;letter-spacing:.5px}
+.modal input{width:100%;background:var(--surface2);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font-d);margin-bottom:12px;outline:none}
+.modal input:focus{border-color:var(--accent)}
+.emoji-picker{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.ep-opt{width:34px;height:34px;border-radius:6px;background:var(--surface2);border:1.5px solid transparent;cursor:pointer;font-size:17px;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.ep-opt.sel{border-color:var(--accent)}
+.ep-opt:hover{border-color:var(--border2)}
+.modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:4px}
+.modal-btns button{padding:9px 20px;border-radius:8px;font-size:13px;font-weight:700;font-family:var(--font-d);cursor:pointer;transition:opacity .15s;border:none}
+.btn-cancel{background:var(--surface2);color:var(--muted)}
+.btn-save{background:var(--accent);color:#0e0e10}
+.btn-cancel:hover,.btn-save:hover{opacity:.8}
+
+/* confirm modal */
+.confirm-modal{background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:1.5rem;width:320px;max-width:92vw;text-align:center}
+.confirm-modal p{font-size:14px;color:var(--muted);margin-bottom:1.25rem;line-height:1.5}
+.confirm-modal .cname{color:var(--text);font-weight:600}
+.confirm-btns{display:flex;gap:8px;justify-content:center}
+.btn-del{background:var(--danger);color:#fff;padding:9px 22px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;border:none;font-family:var(--font-d)}
+.btn-del:hover{opacity:.85}
+
+/* annual */
+.annual-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:1.25rem}
+.month-card{background:var(--surface2);border-radius:8px;padding:1rem}
+.month-card h4{font-size:13px;font-weight:700;margin-bottom:10px}
+.mini-dots{display:flex;flex-wrap:wrap;gap:3px}
+.mini-dot{width:10px;height:10px;border-radius:2px}
+
+@media(max-width:768px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto 1fr}
+  .sidebar{display:none}
+  .stat-row{grid-template-columns:repeat(2,1fr)}
+  .annual-grid{grid-template-columns:1fr}
+  .two-col{flex-direction:column!important}
+}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="app">
+  <div class="topbar">
+    <div class="logo">habit<span>.</span></div>
+    <div class="topbar-right">
+      <div class="tabs">
+        <button class="tab active" id="tabMonthly">Monthly</button>
+        <button class="tab" id="tabAnnual">Annual</button>
+      </div>
+      <div class="month-nav">
+        <button id="prevMonth">←</button>
+        <span class="month-label" id="monthLabel">May 2026</span>
+        <button id="nextMonth">→</button>
+      </div>
+      <button id="exportBtn" title="Download with all your data saved" style="background:var(--accent);color:#0e0e10;border:none;border-radius:8px;padding:7px 14px;font-family:var(--font-d);font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">⬇ Export</button>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">Habits</div>
+    </div>
+    <div class="habit-list-sidebar" id="sidebarHabits"><div class="habit-pill"><span>⏰</span><span>Wake up at 5:00</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>🧘</span><span>Yoga and Stretching exercises</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>📚</span><span>Reading / Learning</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>🚫</span><span>No Alcohol</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>🌿</span><span>No Junk food</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>📖</span><span>Gym</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>✅</span><span>Projects and Research</span><span class="hpct" style="color:var(--danger)">0%</span></div><div class="habit-pill"><span>💰</span><span>Extra Source</span><span class="hpct" style="color:var(--danger)">0%</span></div></div>
+    <div class="sidebar-footer">
+      <button class="add-btn-main" id="sidebarAddBtn">+ Add habit</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- monthly -->
+    <div id="monthlyView">
+      <div class="stat-row" id="statRow">
+    <div class="stat-card" style="--al:var(--accent)"><div class="sc-label">Habits tracked</div><div class="sc-val">8</div><div class="sc-sub">active this month</div></div>
+    <div class="stat-card" style="--al:var(--accent2)"><div class="sc-label">Completed</div><div class="sc-val">0</div><div class="sc-sub">of 192 possible</div></div>
+    <div class="stat-card" style="--al:var(--warn)"><div class="sc-label">Best streak</div><div class="sc-val">0</div><div class="sc-sub">days in a row</div></div>
+    <div class="stat-card" style="--al:var(--danger)"><div class="sc-label">Overall rate</div><div class="sc-val" style="color:var(--danger)">0%</div><div class="sc-sub">completion rate</div></div>
+  </div>
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-title">Monthly progress</span>
+          <span class="progress-pct" id="progressPct">0%</span>
+        </div>
+        <div class="pb-track"><div class="pb-fill" id="pbFill" style="width:0%"></div></div>
+      </div>
+      <div class="grid-section">
+        <div class="grid-header">
+          <span class="grid-title">Habit grid</span>
+          <button class="add-btn-main" id="gridAddBtn" style="width:auto;padding:7px 16px;font-size:12px">+ Add habit</button>
+        </div>
+        <div class="grid-scroll">
+          <table><thead id="gridHead"><tr><th class="th-habit">Habit</th><th class="th-day">Fr<br>1</th><th class="th-day">Sa<br>2</th><th class="th-day">Su<br>3</th><th class="th-day">Mo<br>4</th><th class="th-day">Tu<br>5</th><th class="th-day">We<br>6</th><th class="th-day">Th<br>7</th><th class="th-day">Fr<br>8</th><th class="th-day">Sa<br>9</th><th class="th-day">Su<br>10</th><th class="th-day">Mo<br>11</th><th class="th-day">Tu<br>12</th><th class="th-day">We<br>13</th><th class="th-day">Th<br>14</th><th class="th-day">Fr<br>15</th><th class="th-day">Sa<br>16</th><th class="th-day">Su<br>17</th><th class="th-day">Mo<br>18</th><th class="th-day">Tu<br>19</th><th class="th-day">We<br>20</th><th class="th-day">Th<br>21</th><th class="th-day">Fr<br>22</th><th class="th-day">Sa<br>23</th><th class="th-day today">Su<br>24</th><th class="th-day">Mo<br>25</th><th class="th-day">Tu<br>26</th><th class="th-day">We<br>27</th><th class="th-day">Th<br>28</th><th class="th-day">Fr<br>29</th><th class="th-day">Sa<br>30</th><th class="th-day">Su<br>31</th><th class="th-pct">%</th><th class="th-pct">Goal</th></tr></thead><tbody id="gridBody"><tr data-habit="0"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">⏰</span>
+        <span class="habit-name-text">Wake up at 5:00</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="0" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="0" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="0" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">30</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="1"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">🧘</span>
+        <span class="habit-name-text">Yoga and Stretching exercises</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="1" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="1" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="1" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">30</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="2"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">📚</span>
+        <span class="habit-name-text">Reading / Learning</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="2" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="2" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="2" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">30</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="3"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">🚫</span>
+        <span class="habit-name-text">No Alcohol</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="3" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="3" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="3" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">10</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="4"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">🌿</span>
+        <span class="habit-name-text">No Junk food</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="4" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="4" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="4" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">25</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="5"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">📖</span>
+        <span class="habit-name-text">Gym</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="5" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="5" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="5" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">22</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="6"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">✅</span>
+        <span class="habit-name-text">Projects and Research</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="6" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="6" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="6" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">25</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr data-habit="7"><td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">💰</span>
+        <span class="habit-name-text">Extra Source</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="7" title="Edit">✏️</button>
+          <button class="act-btn del" data-action="delete" data-idx="7" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="1">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="2">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="3">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="4">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="5">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="6">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="7">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="8">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="9">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="10">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="11">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="12">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="13">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="14">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="15">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="16">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="17">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="18">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="19">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="20">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="21">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="22">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="23">
+      </td><td class="td-cell today-col">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="24">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="25" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="26" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="27" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="28" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="29" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="30" disabled="">
+      </td><td class="td-cell">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="7" data-day="31" disabled="">
+      </td><td class="td-pct" style="color:var(--danger)">0%</td><td class="td-goal"><span style="color:var(--danger)">0</span>/<span style="color:var(--muted)">20</span><div class="goal-bar"><div class="goal-fill" style="width:0%;background:var(--danger)"></div></div></td></tr><tr class="summary-row"><td class="td-habit-cell"><div class="habit-row-inner" style="font-family:var(--font-m);font-size:11px;color:var(--muted)">Done</div></td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td></td><td></td></tr><tr class="summary-row"><td class="td-habit-cell"><div class="habit-row-inner" style="font-family:var(--font-m);font-size:11px;color:var(--muted)">Not done</div></td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td>8</td><td></td><td></td></tr></tbody></table>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px" class="two-col">
+        <div class="mood-section" style="flex:1">
+          <div class="mood-header">Mood &amp; motivation</div>
+          <div id="moodGrid"><div class="mood-row"><span class="mood-label">Mood</span><div class="mood-dots"><button class="mood-dot" data-action="mood" data-mkey="mood" data-mval="0">😞</button><button class="mood-dot" data-action="mood" data-mkey="mood" data-mval="1">😐</button><button class="mood-dot" data-action="mood" data-mkey="mood" data-mval="2">🙂</button><button class="mood-dot" data-action="mood" data-mkey="mood" data-mval="3">😊</button><button class="mood-dot" data-action="mood" data-mkey="mood" data-mval="4">😄</button></div></div><div class="mood-row"><span class="mood-label">Motivation</span><div class="mood-dots"><button class="mood-dot" data-action="mood" data-mkey="motivation" data-mval="0">🪫</button><button class="mood-dot" data-action="mood" data-mkey="motivation" data-mval="1">😴</button><button class="mood-dot" data-action="mood" data-mkey="motivation" data-mval="2">⚡</button><button class="mood-dot" data-action="mood" data-mkey="motivation" data-mval="3">🔥</button><button class="mood-dot" data-action="mood" data-mkey="motivation" data-mval="4">💥</button></div></div><div class="mood-row"><span class="mood-label">Energy</span><div class="mood-dots"><button class="mood-dot" data-action="mood" data-mkey="energy" data-mval="0">💤</button><button class="mood-dot" data-action="mood" data-mkey="energy" data-mval="1">😪</button><button class="mood-dot" data-action="mood" data-mkey="energy" data-mval="2">🧘</button><button class="mood-dot" data-action="mood" data-mkey="energy" data-mval="3">💪</button><button class="mood-dot" data-action="mood" data-mkey="energy" data-mval="4">🚀</button></div></div></div>
+        </div>
+        <div class="chart-section" style="flex:1">
+          <div class="chart-header">
+            <span class="chart-title">Daily completion rate</span>
+            <span style="font-size:11px;color:var(--muted)" id="chartAvg">avg 0%</span>
+          </div>
+          <div class="chart-wrap"><canvas id="trendChart" role="img" aria-label="Daily habit completion rate" width="302" height="200" style="display: block; box-sizing: border-box; height: 200px; width: 302px;"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- annual -->
+    <div id="annualView" style="display:none">
+      <div class="grid-section">
+        <div class="grid-header"><span class="grid-title">Annual overview — <span id="annualYear"></span></span></div>
+        <div class="annual-grid" id="annualGrid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ADD / EDIT MODAL -->
+<div class="modal-overlay" id="habitModal">
+  <div class="modal">
+    <h3 id="modalTitle">New habit</h3>
+    <div class="emoji-picker" id="emojiPicker"></div>
+    <label>Habit name</label>
+    <input type="text" id="habitNameInput" placeholder="e.g. Run 5km" maxlength="40">
+    <label>Monthly goal (days)</label>
+    <input type="number" id="habitGoalInput" placeholder="e.g. 20" min="1" max="31">
+    <div class="modal-btns">
+      <button class="btn-cancel" id="modalCancelBtn">Cancel</button>
+      <button class="btn-save" id="modalSaveBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- CONFIRM DELETE MODAL -->
+<div class="modal-overlay" id="confirmModal">
+  <div class="confirm-modal">
+    <h3 style="margin-bottom:.5rem;font-size:16px">Remove habit?</h3>
+    <p>Delete <span class="cname" id="confirmHabitName"></span>? All its check data will be lost.</p>
+    <div class="confirm-btns">
+      <button class="btn-cancel" id="confirmCancelBtn" style="padding:9px 22px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:var(--font-d);border:none">Keep it</button>
+      <button class="btn-del" id="confirmDeleteBtn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!--SNAPSHOT_START-->
+<script>
+(function(){
+var d={"ht_moods_2026_4":"{}","ht_checks_2026_4":"{}","ht_habits_v2":"[{\"name\":\"Wake up at 5:00\",\"emoji\":\"⏰\",\"goal\":30},{\"name\":\"Yoga and Stretching exercises\",\"emoji\":\"🧘\",\"goal\":30},{\"name\":\"Reading / Learning\",\"emoji\":\"📚\",\"goal\":30},{\"name\":\"No Alcohol\",\"emoji\":\"🚫\",\"goal\":10},{\"name\":\"No Junk food\",\"emoji\":\"🌿\",\"goal\":25},{\"name\":\"Gym\",\"emoji\":\"📖\",\"goal\":22},{\"name\":\"Projects and Research\",\"emoji\":\"✅\",\"goal\":25},{\"name\":\"Extra Source\",\"emoji\":\"💰\",\"goal\":20}]"};
+for(var k in d){try{localStorage.setItem(k,d[k]);}catch(e){}}
+})();
+</script>
+<!--SNAPSHOT_END-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+// ── DATA ────────────────────────────────────────────────
+const EMOJIS = ['⏰','💪','📚','📅','💰','🎯','🚫','🌿','📖','🚿','🏃','🧘','💧','🥗','😴','✍️','🎸','🧹','🌅','🧠'];
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const DAY_NAMES = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+const DEFAULT_HABITS = [
+  {name:'Wake up at 5:00',emoji:'⏰',goal:30},
+  {name:'Gym',emoji:'💪',goal:20},
+  {name:'Reading / Learning',emoji:'📚',goal:25},
+  {name:'Day Planning',emoji:'📅',goal:30},
+  {name:'Budget Tracking',emoji:'💰',goal:25},
+  {name:'Project Work',emoji:'🎯',goal:22},
+  {name:'No Alcohol',emoji:'🚫',goal:30},
+  {name:'Social Media Detox',emoji:'🌿',goal:25},
+  {name:'Journaling',emoji:'📖',goal:20},
+  {name:'Cold Shower',emoji:'🚿',goal:15},
+];
+
+let habits = [];
+let checks = {};
+let moods  = {};
+let viewYear  = new Date().getFullYear();
+let viewMonth = new Date().getMonth();
+let currentTab = 'monthly';
+let trendChart = null;
+// modal state
+let selectedEmoji = '✅';
+let editingIndex   = -1; // -1 = new habit, >=0 = edit
+let pendingDelete  = -1;
+
+// ── STORAGE ─────────────────────────────────────────────
+function skey(type,y,m){return `ht_${type}_${y}_${m}`;}
+function loadAll(){
+  try{
+    const h=localStorage.getItem('ht_habits_v2');
+    habits=h?JSON.parse(h):JSON.parse(JSON.stringify(DEFAULT_HABITS));
+  }catch(e){habits=JSON.parse(JSON.stringify(DEFAULT_HABITS));}
+  loadMonthData();
+}
+function loadMonthData(){
+  try{
+    const c=localStorage.getItem(skey('checks',viewYear,viewMonth));
+    checks=c?JSON.parse(c):{};
+    const m=localStorage.getItem(skey('moods',viewYear,viewMonth));
+    moods=m?JSON.parse(m):{};
+  }catch(e){checks={};moods={};}
+}
+function saveAll(){
+  try{
+    localStorage.setItem('ht_habits_v2',JSON.stringify(habits));
+    localStorage.setItem(skey('checks',viewYear,viewMonth),JSON.stringify(checks));
+    localStorage.setItem(skey('moods',viewYear,viewMonth),JSON.stringify(moods));
+  }catch(e){}
+}
+function loadChecksForMonth(y,m){
+  try{const c=localStorage.getItem(skey('checks',y,m));return c?JSON.parse(c):{};}catch(e){return {};}
+}
+
+// ── HELPERS ──────────────────────────────────────────────
+const key=(hIdx,day)=>hIdx+'__'+day;
+const dim=(y,m)=>new Date(y,m+1,0).getDate();
+const isCurMonth=()=>{const n=new Date();return n.getFullYear()===viewYear&&n.getMonth()===viewMonth;};
+const todayDay=()=>new Date().getDate();
+const pctColor=p=>p>=80?'var(--accent)':p>=50?'var(--warn)':'var(--danger)';
+
+function calcPct(hIdx){
+  const limit=isCurMonth()?Math.min(todayDay(),dim(viewYear,viewMonth)):dim(viewYear,viewMonth);
+  if(!limit)return 0;
+  let done=0;for(let d=1;d<=limit;d++)if(checks[key(hIdx,d)])done++;
+  return Math.round(done/limit*100);
+}
+function calcDayTotal(day){return habits.filter((_,i)=>checks[key(i,day)]).length;}
+function calcBestStreak(){
+  let best=0;
+  habits.forEach((_,hIdx)=>{
+    let cur=0;const limit=isCurMonth()?todayDay():dim(viewYear,viewMonth);
+    for(let d=1;d<=limit;d++){if(checks[key(hIdx,d)]){cur++;best=Math.max(best,cur);}else cur=0;}
+  });
+  return best;
+}
+function calcTotalDone(){
+  let t=0;const limit=isCurMonth()?todayDay():dim(viewYear,viewMonth);
+  habits.forEach((_,hIdx)=>{for(let d=1;d<=limit;d++)if(checks[key(hIdx,d)])t++;});
+  return t;
+}
+function calcOverallPct(){
+  const limit=isCurMonth()?todayDay():dim(viewYear,viewMonth);
+  const p=habits.length*limit;if(!p)return 0;
+  return Math.round(calcTotalDone()/p*100);
+}
+
+// ── RENDER ───────────────────────────────────────────────
+function render(){
+  document.getElementById('monthLabel').textContent=MONTH_NAMES[viewMonth]+' '+viewYear;
+  if(currentTab==='monthly'){
+    renderStats();renderProgress();renderGrid();renderMoods();renderChart();
+  }else{
+    renderAnnual();
+  }
+  renderSidebar();
+}
+
+function renderStats(){
+  const pct=calcOverallPct(),streak=calcBestStreak(),done=calcTotalDone();
+  const limit=isCurMonth()?todayDay():dim(viewYear,viewMonth);
+  document.getElementById('statRow').innerHTML=`
+    <div class="stat-card" style="--al:var(--accent)"><div class="sc-label">Habits tracked</div><div class="sc-val">${habits.length}</div><div class="sc-sub">active this month</div></div>
+    <div class="stat-card" style="--al:var(--accent2)"><div class="sc-label">Completed</div><div class="sc-val">${done}</div><div class="sc-sub">of ${habits.length*limit} possible</div></div>
+    <div class="stat-card" style="--al:var(--warn)"><div class="sc-label">Best streak</div><div class="sc-val">${streak}</div><div class="sc-sub">days in a row</div></div>
+    <div class="stat-card" style="--al:${pctColor(pct)}"><div class="sc-label">Overall rate</div><div class="sc-val" style="color:${pctColor(pct)}">${pct}%</div><div class="sc-sub">completion rate</div></div>
+  `;
+}
+
+function renderProgress(){
+  const pct=calcOverallPct();
+  document.getElementById('progressPct').textContent=pct+'%';
+  document.getElementById('pbFill').style.width=pct+'%';
+}
+
+function renderGrid(){
+  const DAYS=dim(viewYear,viewMonth),isCur=isCurMonth(),td=todayDay();
+  let headH='<tr><th class="th-habit">Habit</th>';
+  for(let d=1;d<=DAYS;d++){
+    const dow=new Date(viewYear,viewMonth,d).getDay();
+    const isToday=isCur&&d===td;
+    headH+=`<th class="th-day${isToday?' today':''}">${DAY_NAMES[dow]}<br>${d}</th>`;
+  }
+  headH+='<th class="th-pct">%</th><th class="th-pct">Goal</th></tr>';
+  document.getElementById('gridHead').innerHTML=headH;
+
+  let bodyH='';
+  habits.forEach((h,hIdx)=>{
+    bodyH+=`<tr data-habit="${hIdx}">`;
+    bodyH+=`<td class="td-habit-cell">
+      <div class="habit-row-inner">
+        <span class="habit-emoji">${h.emoji}</span>
+        <span class="habit-name-text">${escHtml(h.name)}</span>
+        <span class="habit-actions">
+          <button class="act-btn edit" data-action="edit" data-idx="${hIdx}" title="Edit">✏️</button>
+          <button class="act-btn del"  data-action="delete" data-idx="${hIdx}" title="Delete">🗑️</button>
+        </span>
+      </div>
+    </td>`;
+    for(let d=1;d<=DAYS;d++){
+      const done=!!checks[key(hIdx,d)];
+      const isToday=isCur&&d===td;
+      const future=isCur&&d>td;
+      bodyH+=`<td class="td-cell${isToday?' today-col':''}">
+        <input type="checkbox" class="cb" data-action="toggle" data-idx="${hIdx}" data-day="${d}" ${done?'checked':''} ${future?'disabled':''}>
+      </td>`;
+    }
+    const pct=calcPct(hIdx);
+    const goal=h.goal||20;
+    let actual=0;for(let d=1;d<=DAYS;d++)if(checks[key(hIdx,d)])actual++;
+    const gp=Math.min(100,Math.round(actual/goal*100));
+    bodyH+=`<td class="td-pct" style="color:${pctColor(pct)}">${pct}%</td>`;
+    bodyH+=`<td class="td-goal"><span style="color:${pctColor(gp)}">${actual}</span>/<span style="color:var(--muted)">${goal}</span><div class="goal-bar"><div class="goal-fill" style="width:${gp}%;background:${pctColor(gp)}"></div></div></td>`;
+    bodyH+='</tr>';
+  });
+
+  // summary rows
+  bodyH+=`<tr class="summary-row"><td class="td-habit-cell"><div class="habit-row-inner" style="font-family:var(--font-m);font-size:11px;color:var(--muted)">Done</div></td>`;
+  for(let d=1;d<=DAYS;d++)bodyH+=`<td>${calcDayTotal(d)}</td>`;
+  bodyH+=`<td></td><td></td></tr>`;
+
+  bodyH+=`<tr class="summary-row"><td class="td-habit-cell"><div class="habit-row-inner" style="font-family:var(--font-m);font-size:11px;color:var(--muted)">Not done</div></td>`;
+  for(let d=1;d<=DAYS;d++)bodyH+=`<td>${habits.length-calcDayTotal(d)}</td>`;
+  bodyH+=`<td></td><td></td></tr>`;
+
+  document.getElementById('gridBody').innerHTML=bodyH;
+}
+
+function renderMoods(){
+  const types=[
+    {key:'mood',label:'Mood',opts:['😞','😐','🙂','😊','😄']},
+    {key:'motivation',label:'Motivation',opts:['🪫','😴','⚡','🔥','💥']},
+    {key:'energy',label:'Energy',opts:['💤','😪','🧘','💪','🚀']},
+  ];
+  let h='';
+  types.forEach(mt=>{
+    h+=`<div class="mood-row"><span class="mood-label">${mt.label}</span><div class="mood-dots">`;
+    mt.opts.forEach((opt,i)=>{
+      h+=`<button class="mood-dot${moods[mt.key]===i?' selected':''}" data-action="mood" data-mkey="${mt.key}" data-mval="${i}">${opt}</button>`;
+    });
+    h+=`</div></div>`;
+  });
+  document.getElementById('moodGrid').innerHTML=h;
+}
+
+function renderChart(){
+  const DAYS=dim(viewYear,viewMonth),isCur=isCurMonth();
+  const limit=isCur?Math.min(todayDay(),DAYS):DAYS;
+  const labels=[],data=[];
+  for(let d=1;d<=limit;d++){
+    labels.push(d);
+    data.push(habits.length?Math.round(calcDayTotal(d)/habits.length*100):0);
+  }
+  const avg=data.length?Math.round(data.reduce((a,b)=>a+b,0)/data.length):0;
+  document.getElementById('chartAvg').textContent=`avg ${avg}%`;
+  const ctx=document.getElementById('trendChart').getContext('2d');
+  if(trendChart)trendChart.destroy();
+  trendChart=new Chart(ctx,{
+    type:'line',
+    data:{labels,datasets:[{data,borderColor:'#b5f565',backgroundColor:'rgba(181,245,101,0.08)',fill:true,tension:.4,pointRadius:2,pointBackgroundColor:'#b5f565',borderWidth:2}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:v=>v.raw+'%'}}},
+      scales:{x:{ticks:{font:{size:10},color:'#888'},grid:{color:'rgba(255,255,255,0.05)'}},
+              y:{min:0,max:100,ticks:{font:{size:10},color:'#888',callback:v=>v+'%'},grid:{color:'rgba(255,255,255,0.05)'}}}}
+  });
+}
+
+function renderSidebar(){
+  let h='';
+  habits.forEach((hab,i)=>{
+    const pct=calcPct(i);
+    h+=`<div class="habit-pill"><span>${hab.emoji}</span><span>${escHtml(hab.name)}</span><span class="hpct" style="color:${pctColor(pct)}">${pct}%</span></div>`;
+  });
+  document.getElementById('sidebarHabits').innerHTML=h;
+}
+
+function renderAnnual(){
+  document.getElementById('annualYear').textContent=viewYear;
+  const now=new Date();let h='';
+  for(let m=0;m<12;m++){
+    const mc=loadChecksForMonth(viewYear,m),DAYS=dim(viewYear,m);
+    const isFuture=new Date(viewYear,m,1)>now;
+    let dots='';
+    for(let d=1;d<=DAYS;d++){
+      const done=habits.filter((_,i)=>mc[key(i,d)]).length;
+      const p=habits.length?done/habits.length:0;
+      const col=isFuture?'#2a2a2e':p===0?'#2a2a30':p<.5?'#3b4a2a':p<.8?'#7ab83b':'#b5f565';
+      dots+=`<div class="mini-dot" style="background:${col}" title="Day ${d}: ${Math.round(p*100)}%"></div>`;
+    }
+    let mp=0;
+    if(!isFuture){let md=0;habits.forEach((_,i)=>{for(let d=1;d<=DAYS;d++)if(mc[key(i,d)])md++;});mp=habits.length*DAYS?Math.round(md/(habits.length*DAYS)*100):0;}
+    h+=`<div class="month-card"><h4>${MONTH_NAMES[m]} <span style="color:${pctColor(mp)};font-size:11px;font-family:var(--font-m)">${isFuture?'':mp+'%'}</span></h4><div class="mini-dots">${dots}</div></div>`;
+  }
+  document.getElementById('annualGrid').innerHTML=h;
+}
+
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ── HABIT MODAL ──────────────────────────────────────────
+function buildEmojiPicker(){
+  let h='';
+  EMOJIS.forEach(e=>{h+=`<div class="ep-opt${e===selectedEmoji?' sel':''}" data-emoji="${e}">${e}</div>`;});
+  document.getElementById('emojiPicker').innerHTML=h;
+}
+
+function openAddModal(){
+  editingIndex=-1;
+  selectedEmoji='✅';
+  document.getElementById('modalTitle').textContent='New habit';
+  document.getElementById('habitNameInput').value='';
+  document.getElementById('habitGoalInput').value='';
+  buildEmojiPicker();
+  document.getElementById('habitModal').classList.add('open');
+  setTimeout(()=>document.getElementById('habitNameInput').focus(),80);
+}
+
+function openEditModal(idx){
+  editingIndex=idx;
+  const h=habits[idx];
+  selectedEmoji=h.emoji||'✅';
+  document.getElementById('modalTitle').textContent='Edit habit';
+  document.getElementById('habitNameInput').value=h.name;
+  document.getElementById('habitGoalInput').value=h.goal||20;
+  buildEmojiPicker();
+  document.getElementById('habitModal').classList.add('open');
+  setTimeout(()=>document.getElementById('habitNameInput').focus(),80);
+}
+
+function closeHabitModal(){document.getElementById('habitModal').classList.remove('open');}
+
+function saveHabit(){
+  const name=document.getElementById('habitNameInput').value.trim();
+  if(!name)return;
+  const goal=parseInt(document.getElementById('habitGoalInput').value)||20;
+  if(editingIndex>=0){
+    habits[editingIndex]={...habits[editingIndex],name,emoji:selectedEmoji,goal};
+  }else{
+    habits.push({name,emoji:selectedEmoji,goal});
+  }
+  saveAll();closeHabitModal();render();
+}
+
+// ── DELETE MODAL ─────────────────────────────────────────
+function openDeleteModal(idx){
+  pendingDelete=idx;
+  document.getElementById('confirmHabitName').textContent='"'+habits[idx].name+'"';
+  document.getElementById('confirmModal').classList.add('open');
+}
+function closeDeleteModal(){document.getElementById('confirmModal').classList.remove('open');pendingDelete=-1;}
+function confirmDelete(){
+  if(pendingDelete<0)return;
+  const newChecks={};
+  Object.entries(checks).forEach(([k,v])=>{
+    const [idx,day]=k.split('__');const ni=parseInt(idx);
+    if(ni<pendingDelete)newChecks[k]=v;
+    else if(ni>pendingDelete)newChecks[(ni-1)+'__'+day]=v;
+  });
+  checks=newChecks;
+  habits.splice(pendingDelete,1);
+  saveAll();closeDeleteModal();render();
+}
+
+// ── EVENT DELEGATION ─────────────────────────────────────
+document.addEventListener('click',function(e){
+  // emoji picker inside habit modal
+  const epOpt=e.target.closest('.ep-opt');
+  if(epOpt){
+    selectedEmoji=epOpt.dataset.emoji;
+    document.querySelectorAll('.ep-opt').forEach(o=>o.classList.remove('sel'));
+    epOpt.classList.add('sel');
+    return;
+  }
+  // action buttons in grid
+  const btn=e.target.closest('[data-action]');
+  if(!btn)return;
+  const action=btn.dataset.action;
+  if(action==='toggle'){
+    const hIdx=parseInt(btn.dataset.idx),day=parseInt(btn.dataset.day);
+    checks[key(hIdx,day)]=btn.checked;
+    saveAll();
+    // update summary rows without full re-render for speed
+    renderStats();renderProgress();renderSidebar();
+    // update pct cell in same row
+    const tr=btn.closest('tr');
+    if(tr){
+      const pctTd=tr.querySelector('.td-pct');
+      const pct=calcPct(hIdx);
+      if(pctTd){pctTd.textContent=pct+'%';pctTd.style.color=pctColor(pct);}
+    }
+    // update done/not-done summary rows
+    const sumRows=document.querySelectorAll('.summary-row');
+    if(sumRows.length>=2){
+      const allTds0=sumRows[0].querySelectorAll('td');
+      const allTds1=sumRows[1].querySelectorAll('td');
+      const DAYS=dim(viewYear,viewMonth);
+      for(let d=1;d<=DAYS;d++){
+        if(allTds0[d])allTds0[d].textContent=calcDayTotal(d);
+        if(allTds1[d])allTds1[d].textContent=habits.length-calcDayTotal(d);
+      }
+    }
+    return;
+  }
+  if(action==='edit'){openEditModal(parseInt(btn.dataset.idx));return;}
+  if(action==='delete'){openDeleteModal(parseInt(btn.dataset.idx));return;}
+  if(action==='mood'){
+    moods[btn.dataset.mkey]=parseInt(btn.dataset.mval);
+    saveAll();renderMoods();return;
+  }
+});
+
+// modal buttons
+document.getElementById('modalCancelBtn').onclick=closeHabitModal;
+document.getElementById('modalSaveBtn').onclick=saveHabit;
+document.getElementById('confirmCancelBtn').onclick=closeDeleteModal;
+document.getElementById('confirmDeleteBtn').onclick=confirmDelete;
+document.getElementById('sidebarAddBtn').onclick=openAddModal;
+document.getElementById('gridAddBtn').onclick=openAddModal;
+document.getElementById('prevMonth').onclick=()=>{viewMonth--;if(viewMonth<0){viewMonth=11;viewYear--;}loadMonthData();render();};
+document.getElementById('nextMonth').onclick=()=>{viewMonth++;if(viewMonth>11){viewMonth=0;viewYear++;}loadMonthData();render();};
+
+document.getElementById('tabMonthly').onclick=function(){
+  currentTab='monthly';
+  this.classList.add('active');document.getElementById('tabAnnual').classList.remove('active');
+  document.getElementById('monthlyView').style.display='';
+  document.getElementById('annualView').style.display='none';
+  render();
+};
+document.getElementById('tabAnnual').onclick=function(){
+  currentTab='annual';
+  this.classList.add('active');document.getElementById('tabMonthly').classList.remove('active');
+  document.getElementById('monthlyView').style.display='none';
+  document.getElementById('annualView').style.display='block';
+  render();
+};
+
+// close modals on overlay click
+document.getElementById('habitModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeHabitModal();});
+document.getElementById('confirmModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeDeleteModal();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeHabitModal();closeDeleteModal();}});
+
+// ── EXPORT ───────────────────────────────────────────────
+// Grabs the ENTIRE current page source via document.documentElement,
+// strips any old injected snapshot, injects a fresh one with all
+// current localStorage data, and downloads it.  Works on file:// too.
+document.getElementById('exportBtn').onclick=function(){
+  // 1. Collect all tracker data from localStorage
+  const snapshot={};
+  for(let i=0;i<localStorage.length;i++){
+    const k=localStorage.key(i);
+    if(k&&k.startsWith('ht_')) snapshot[k]=localStorage.getItem(k);
+  }
+
+  // 2. Get the live HTML of the current page (no file read needed)
+  let html='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+
+  // 3. Remove any previously injected snapshot block
+  html=html.replace(/\s*/g,'');
+
+  // 4. Build the injection script — runs before loadAll() so data is ready
+  const injection=`\n`;
+
+  // 5. Insert right before the Chart.js script tag (stable anchor point)
+  const anchor='<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js">';
+  if(html.includes(anchor)){
+    html=html.replace(anchor, injection+anchor);
+  } else {
+    // fallback: inject before closing </body>
+    html=html.replace('</body>', injection+'</body>');
+  }
+
+  // 6. Download
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='habit-tracker.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
+
+// ── INIT ─────────────────────────────────────────────────
+loadAll();
+render();
+</script>
+
+
+</body></html>
