@@ -1,0 +1,18 @@
+{
+  "background_color": "#111111",
+  "dir": "ltr",
+  "display": "standalone",
+  "name": "pramodpilli.github",
+  "orientation": "portrait",
+  "scope": "/habit-dashboard/",
+  "short_name": "pramodpilli.github",
+  "start_url": "https://pramodpilli.github.io/habit-dashboard/",
+  "theme_color": "#111111",
+  "id": "/ habit-dashboard",
+  "description": "Personal Habit Tracker with streaks, goals and progress analytics.",
+  "lang": "en",
+  "categories": [
+    "productivity",
+    "utilities"
+  ]
+}
